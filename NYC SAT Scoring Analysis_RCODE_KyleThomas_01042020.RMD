@@ -1,0 +1,647 @@
+#Loading in necessary packages
+
+library(caret)
+library(geosphere)
+library(dplyr)
+library(ggplot2)
+library(penalized)
+library(corrplot)
+library(RSocrata)
+library(MASS)
+library(randomForest)
+library(rpart)
+library(e1071)
+library(factoextra)
+
+#Reading in data via Socrata API 
+
+df_asp <- read.socrata("https://data.cityofnewyork.us/resource/mbd7-jfnc.json") 
+df_ac <- read.socrata("https://data.cityofnewyork.us/resource/ihfw-zy9j.json")
+df_sat_12 <- read.socrata("https://data.cityofnewyork.us/resource/f9bf-2cp4.json")
+df_sat_10 <- read.socrata("https://data.cityofnewyork.us/resource/zt9s-n5aj.json")
+df_hs <- read.socrata("https://data.cityofnewyork.us/resource/s3k6-pzi2.json")
+
+#Appending and processing SAT datasets
+
+df_sat_10 <- df_sat_10 %>% mutate(school_year = 2010)
+df_sat_12 <- df_sat_12 %>% mutate(school_year = 2012)
+
+for (i in 1:4) {
+
+df_sat_10[,i+2] = as.numeric(df_sat_10[,i+2])
+df_sat_12[,i+2] = as.numeric(df_sat_12[,i+2])
+
+}
+
+colnames(df_sat_12) <- colnames(df_sat_10)
+
+#Cleaning Accountabiity datasets
+
+df_sat_c <- rbind(df_sat_10,df_sat_12)
+df_sat_c_clean = df_sat_c[-which(is.na(df_sat_c$number_of_test_takers)),]
+
+df_ac_2010 <- subset(df_ac, schoolyear == 20092010)
+df_ac_2012 <- subset(df_ac, schoolyear == 20112012)
+df_ac_c <- rbind(df_ac_2010,df_ac_2012)
+rm(df_ac_2010, df_ac_2010_2012, df_ac_2012)
+rm(df_sat_10,df_sat_12)
+
+#Instantiating custom substring function for text cleansing
+
+substrRight <- function(x, n){
+    
+     substr(x, nchar(x)-n+1, nchar(x))
+     
+}
+
+#Cleaning high school directory dataset
+
+df_hs_sub <- df_hs[,c(1:3,11,23:25)]
+
+df_hs_sub <- df_hs_sub %>% mutate(lat_lon = trimws(substrRight(location, 23)))
+
+df_hs_sub <- df_hs_sub %>% mutate(lon = substr(lat_lon,gregexpr(pattern = '-', trimws(lat_lon))[1][1],as.integer(paste(gregexpr(pattern = ')',trimws(lat_lon))[1][1])) - 1))
+
+df_hs_sub <- df_hs_sub %>% mutate(lat = substr(lat_lon,gregexpr(pattern = '4', lat_lon)[1][1],as.integer(paste(gregexpr(pattern = ',',lat_lon)[1][1])) - 1))
+
+
+df_hs_sub$lon <- gsub(")","",df_hs_sub$lon)
+df_hs_sub$lon <- gsub(", ","",df_hs_sub$lon)
+df_hs_sub$lon <- trimws(df_hs_sub$lon)
+df_hs_sub <- df_hs_sub[-364,]
+df_hs_sub <- df_hs_sub[-305,]
+df_hs_sub$lon <- as.numeric(df_hs_sub$lon)
+df_hs_sub$lon[which(df_hs_sub$lon > 0)] <- df_hs_sub[which(df_hs_sub$lon > 0),9] * -1
+
+df_hs_sub$lat <- gsub("log\\(", "",df_hs_sub$lat)
+df_hs_sub$lat[214] <- "40.74651"
+df_hs_sub$lat[127] <- "40.765474" 
+df_hs_sub$lat[56] <- "40.765474"
+df_hs_sub$lat[288] <- "40.74651"
+df_hs_sub$lat <- gsub(",","",df_hs_sub$lat)
+df_hs_sub$lat <- as.numeric(df_hs_sub$lat)
+df_hs_sub$lat_lon[which(is.na(df_hs_sub$lat))]
+
+repl <- c(40.765474,40.6921,40.765474,40.765474,40.6351,40.8185,40.74651,40.8381)
+df_hs_sub$lat[which(is.na(df_hs_sub$lat))] <- repl
+
+df_ac_c <- df_ac_c %>% mutate(school_year = ifelse(schoolyear == "20092010",2010,2012))
+df_hs_sub <- df_hs_sub[,c(-4,-8)]
+
+#Beginning to create master table from child tables 
+
+comb1_c <- left_join(df_sat_c_clean, df_hs_sub, by = c("dbn" = "dbn"))
+comb2_c <- left_join(comb1_c,df_ac_c,by = c("dbn" = "dbn", "school_year" = "school_year"))
+
+
+#Loop identifies 5 closest after-school programs for each observed high school, it then computes the distance between the high school and program location, and grabs the program type
+#We can use structure this data as predictive features for our response variable
+
+locations <- data.frame(dbn = character(438), dist1 = double(438), type1 = character(438), dist2 = double(438), type2 = character(438), dist3 = double(438), type3 = character(438), dist4 = double(438), type4 = character(438), dist5 = double(438), type5 = character(438))
+
+locations$dbn <- replicate(438,"d")
+locations$type1 <- replicate(438,"d")
+locations$type2 <- replicate(438,"d")
+locations$type3 <- replicate(438,"d")
+locations$type4 <- replicate(438,"d")
+locations$type5 <- replicate(438,"d")
+
+
+dist = double(length(df_asp$program))
+locs = character(length(df_asp$program))
+
+
+for (i in 1:length(df_hs_sub$dbn)) {
+    
+    locations$dbn[i] = as.character(df_hs_sub$dbn[i])
+    
+    for (j in 1:length(df_asp$program)) {
+        
+        
+        dist[j] = distm(c(df_hs_sub$lat[i],df_hs_sub$lon[i]), c(as.double(df_asp$location_1.latitude[j]), as.double(df_asp$location_1.longitude[j])), fun = distHaversine)
+        
+        locs[j] = as.character(df_asp$program_type[j])
+        
+        
+        
+        
+    }
+    
+    
+    df_temp = data.frame(dist,locs)
+    df_temp = df_temp[order(dist),]
+    
+    
+    for (k in 1:5) {
+        
+        locations[i,k*2] = df_temp$dist[k+1]
+        locations[i,(k*2)+1] = as.character(df_temp$locs[k+1])
+        
+        
+    }
+    
+}
+
+
+
+#Continuing to merge additional datasets for master table
+
+
+comb3_c <- left_join(comb2_c,locations,by = c("dbn" = "dbn"))
+comb4_c <- comb3_c[,-c(1,2,7,8,13:17)]
+rownames(comb4_c) <-  paste(comb3_c$school_name.x, comb3_c$school_year, sep = " ")
+
+#Pre-processing columns to check for non-numeric types, replacing NAs with -1 to easily identify values to replace
+
+for (i in 6:42) {
+     
+     if (is.numeric(comb4_c[,i])) {
+     
+     comb4_c[which(is.na(comb4_c[,i])),i] <- -1 
+     
+     } else {
+         
+         comb4_c[,i] <- as.numeric(comb4_c[,i])
+         comb4_c[which(is.na(comb4_c[,i])),i] <- -1 
+         
+     }
+     
+ }
+
+
+#Adding conditional columns to check if school has grades lower than 9 (HS + elementary / middle grades)
+
+comb4_c <- comb4_c %>% mutate(hasMiddle = ifelse((comb4_c$grade6 + comb4_c$grade7 + comb4_c$grade8) > 0, 1, 0))
+comb4_c <- comb4_c %>% mutate(hasElementary = ifelse((comb4_c$prek + comb4_c$k + comb4_c$grade1 + comb4_c$grade2 + comb4_c$grade3 + comb4_c$grade4 + comb4_c$grade5) > 0, 1, 0))
+
+
+#Computing average distance to after-school programs for each high school
+
+for (i in 1:807) {
+    
+     comb4_c$avgASD[i] = (as.numeric(comb4_c$dist1[i])+
+                              as.numeric(comb4_c$dist2[i])+
+                              as.numeric(comb4_c$dist3[i])+
+                              as.numeric(comb4_c$dist4[i])+
+                              as.numeric(comb4_c$dist5[i])) / 5
+     
+ }
+
+#Creating one-off table with all distinct values of after-school programs
+
+types = rbind(data.frame(type = comb4_c$type1),data.frame(type = comb4_c$type2),data.frame(type = comb4_c$type3),data.frame(type = comb4_c$type4),data.frame(type = comb4_c$type5))
+
+types <- types[-which(is.na(types$type)),1]
+types <- as.data.frame(types)
+
+bucket = character(3175)
+types = data.frame(types,bucket)
+
+#Bucketing general programs to fit smaller factor levels (useful to eliminate degrees of freedom in predictive modeling)
+
+types$bucket = replicate(3175, "m")
+
+for (i in 1:3175){
+     
+     if (grepl("Reading & Writing", types$types[i])) {
+         types$bucket[i] = "Reading & Writing"
+         
+     } else if (grepl("Immigration Services",types$types[i])) {
+         
+         types$bucket[i] = "Immigration Services"
+         
+     } else if (grepl("Jobs & Internships", types$types[i])) {
+         
+         types$bucket[i] = "Jobs & Internships"
+         
+     } else if (grepl("NDA Programs", types$types[i])) {
+         
+         types$bucket[i] = "NDA Programs"
+         
+     } else if (grepl("Homeless", types$types[i])) {
+         
+         types$bucket[i] = "Runaway & Homeless Youth"
+         
+     } else {
+         
+         types$bucket[i] = "After-School Programs"
+         
+     }
+     
+     
+ }
+
+
+#Plotting composition of after-school programs
+
+ggplot(types, aes(x = forcats::fct_infreq(bucket))) + geom_bar(aes(y=..count.., fill = types)) +  theme(legend.text=element_text(size=13), axis.text.x = element_text(size=13, angle=45)) + xlab("After-School Programs Composition")
+
+#Creating lookup table to map values in master table
+
+types_lookup <- types %>% distinct(types,bucket) %>% select(types,bucket)
+
+comb4_c <- left_join(comb4_c,types_lookup,by = c("type1" = "types"))
+comb4_c <- left_join(comb4_c,types_lookup,by = c("type2" = "types"))
+comb4_c <- left_join(comb4_c,types_lookup,by = c("type3" = "types"))
+comb4_c <- left_join(comb4_c,types_lookup,by = c("type4" = "types"))
+comb4_c <- left_join(comb4_c,types_lookup,by = c("type5" = "types"))
+
+#Further data cleansing on master table
+
+colnames(comb4_c)[56:60] <- c("bucket1","bucket2","bucket3","bucket4","bucket5")
+comb4_c <- comb4_c[,-c(43:52)]
+rownames(comb4_c) <-  paste(comb3_c$school_name.x, comb3_c$school_year, sep = " ")
+comb5_c <- comb4_c[-which(is.na(comb4_c$bucket1)),]
+comb5_c <- comb5_c[,-c(10:17,37,38)]
+
+#Deleting any count columns and leaving percentage in (as total_enrolled is already included in data; helps prevent multicollinearity)
+
+for (i in 2:40) {
+     
+     if (grepl("num",colnames(comb5_c)[i])) {
+         
+         comb5_c <- comb5_c[,-i]
+     }
+     
+}
+
+
+comb5_c <- comb5_c[,-12]
+
+buckets.df <- types_lookup %>% distinct(bucket)
+
+for (i in 1:6) {
+    
+    df_temp <- data.frame(temp = integer(635))
+    colnames(df_temp)[1] = buckets.df[i,1]
+    
+    comb5_c <- data.frame(comb5_c, df_temp)
+    
+    
+}
+
+#One (multiple)-hot encoding for all after-school program buckets
+
+for (i in  1:635) {
+    
+    for (j in 1:5) {
+        
+        
+        if (comb5_c[i, 25+j] == "After-School Programs") {
+            
+            comb5_c[i,31] = comb5_c[i,31] + 1
+            
+        } else if (comb5_c[i, 25+j] == "Immigration Services") {
+            
+            comb5_c[i,32] = comb5_c[i,32] + 1
+            
+        } else if (comb5_c[i, 25 +j] == "Jobs & Internships") {
+            
+            comb5_c[i,33] = comb5_c[i,33] + 1
+            
+        } else if (comb5_c[i, 25 +j] == "NDA Programs") {
+            
+            comb5_c[i,34] = comb5_c[i,34] + 1
+            
+        } else if (comb5_c[i, 25 +j] == "Reading & Writing") {
+            
+            comb5_c[i,35] = comb5_c[i,35] + 1
+            
+        } else if (comb5_c[i, 25 +j] == "Runaway & Homeless Youth") {
+            
+            comb5_c[i,36] = comb5_c[i,36] + 1
+            
+        }
+        
+        
+        
+        
+    }
+    
+    
+}
+
+#Replacing borough symbols with actual borough names
+
+comb5_c$boro[comb5_c$boro == "K"] <- "Staten Island"
+comb5_c$boro[comb5_c$boro == "M"] <- "Manhattan"
+comb5_c$boro[comb5_c$boro == "Q"] <- "Queens"
+comb5_c$boro[comb5_c$boro == "R"] <- "Brooklyn"
+comb5_c$boro[comb5_c$boro == "X"] <- "Bronx"
+
+comb2_c$boro[comb2_c$boro == "K"] <- "Staten Island"
+comb2_c$boro[comb2_c$boro == "M"] <- "Manhattan"
+comb2_c$boro[comb2_c$boro == "Q"] <- "Queens"
+comb2_c$boro[comb2_c$boro == "R"] <- "Brooklyn"
+comb2_c$boro[comb2_c$boro == "X"] <- "Bronx"
+
+
+
+#Removing duplicate features
+
+comb5_c <- comb5_c[,-c(26:30)]
+
+
+#Splitting dataset into 3 response variables
+
+df_reading <- comb5_c[,-c(3,4)]
+df_math <- comb5_c[,-c(2,4)]
+df_writing <- comb5_c[,-c(2,3)]
+
+#EDA
+
+cors <- cor(comb5_c[,-5])
+corrplot(cors)
+
+
+comb2_c <- comb2_c %>% mutate(total_score_mean = critical_reading_mean + mathematics_mean + writing_mean)
+
+
+#Plots
+
+ggplot(subset(comb5_c, attendance_rate > 0), aes(attendance_rate, critical_reading_mean)) + geom_point() + xlab("Attendance Rate (%)") + ylab("SAT Reading Score") + scale_x_continuous(labels = scales::percent)
+
+ggplot(subset(comb5_c, attendance_rate > 0), aes(attendance_rate, critical_reading_mean)) + geom_density2d() + xlab("Attendance Rate (%)") + ylab("SAT Reading Score") + xlim(0.525,1) + scale_x_continuous(labels = scales::percent) + ylim(c(300,700)) 
+
+ggplot(comb2_c) + geom_bar(aes(x=boro, y=..count..,fill = factor(school_year))) + facet_wrap(~school_year) + xlab("Borough") + ylab("School w/ SAT Record Count")
+
+ggplot(subset(comb2_c, boro != "NA"), aes(boro,total_score_mean)) + geom_violin(aes(fill=factor(school_year)))
+
+ggplot(subset(comb2_c, boro != "NA"), aes(x=total_score_mean, group=boro, fill=boro)) +
+geom_density(adjust=1.5, alpha=.4)
+
+total_2010 <- subset(comb2_c, school_year == 2010)$total_score_mean
+total_2012 <- subset(comb2_c, school_year == 2012)$total_score_mean
+
+t.test(total_2010,total_2012,paired=F)
+wilcox.test(total_2010,total_2012)
+
+ggplot(subset(comb2_c, boro != "NA"), aes(school_year,number_of_test_takers)) + geom_boxplot(aes(fill=factor(school_year)))
+
+j = c(replicate(635,"Reading Score"), replicate(635,"Math Score"),replicate(635,"Writing Score"))
+df_s = data.frame(comb5_c$critical_reading_mean)
+df_s2 = data.frame(comb5_c$mathematics_mean)
+df_s3 = data.frame(comb5_c$writing_mean)
+colnames(df_s) = "SAT Score"
+colnames(df_s2) = "SAT Score"
+colnames(df_s3) = "SAT Score"
+df_s4 <- rbind(df_s,df_s2,df_s3)
+df_s4 <- data.frame(df_s4,j)
+colnames(df_s4)[2] = "Test"
+j2 = c(comb5_c$boro,comb5_c$boro,comb5_c$boro)
+df_s4 <- data.frame(df_s4,j2)
+colnames(df_s4)[3] = "Borough"
+
+ggplot(df_s4, aes(Test,SAT.Score)) + geom_violin(aes(fill=Test))
+ggplot(df_s4, aes(Test,SAT.Score)) + geom_violin(aes(fill=Borough))
+
+qqnorm(df_s4[df_s4$Test == "Writing Score",1])
+qqnorm(log(df_s4[df_s4$Test == "Writing Score",1]))
+shapiro.test(log(df_s4[df_s4$Test == "Writing Score",1]))
+
+#Heavy tails inform non-normality; checking both t-test and wilcox test to understand location differences
+
+t.test(df_s4[df_s4$Test == "Math Score",1], df_s4[df_s4$Test == "Reading Score",1], paired = T)
+wilcox.test(df_s4[df_s4$Test == "Math Score",1], df_s4[df_s4$Test == "Reading Score",1], paired = T)
+t.test(df_s4[df_s4$Test == "Writing Score",1], df_s4[df_s4$Test == "Reading Score",1], paired = T)
+wilcox.test(df_s4[df_s4$Test == "Writing Score",1], df_s4[df_s4$Test == "Reading Score",1], paired = T)
+t.test(df_s4[df_s4$Test == "Math Score",1], df_s4[df_s4$Test == "Writing Score",1], paired = T)
+wilcox.test(df_s4[df_s4$Test == "Writing Score",1], df_s4[df_s4$Test == "Reading Score",1], paired = T)
+
+#More Plots
+
+ggplot(comb5_c,aes(critical_reading_mean,writing_mean)) + geom_point()
+ggplot(comb5_c,aes(critical_reading_mean,mathematics_mean)) + geom_point()
+ggplot(subset(comb2_c,boro!="NA"),aes(number_of_test_takers/as.numeric(total_enrollment),total_score_mean)) + geom_point(aes(color=boro))
+
+ggplot(comb5_c, aes(avgASD)) + geom_density(aes(fill=boro),alpha=0.5)
+ggplot(comb5_c, aes(ell_percent)) + geom_density(aes(fill=boro),alpha=0.5)
+ggplot(comb5_c, aes(ell_percent/100)) + geom_histogram() + xlab("Percentage of English Learners (%)") + scale_x_continuous(labels = scales::percent)
+ggplot(subset(subset(comb5_c, ell_percent < 18), avgASD < 400), aes(factor(Reading...Writing), critical_reading_mean)) + geom_boxplot(aes(fill = factor(Reading...Writing))) + xlab("Count of Reading & Writing After-School Programs")
+
+
+#Predictions / Model
+
+
+
+#Manual K-Fold - LM, RF, RPART, SVM Regression on Critical Reading Means
+
+#Setting K-Fold Training data to 85% of data, 15% for Cross-Validation
+
+smp_size <- floor(0.85 * nrow(comb5_c))
+ 
+## set the seed to make your partition reproducible
+
+set.seed(123)
+train_ind <- sample(seq_len(nrow(df_reading)), size = smp_size)
+ 
+train_r <- df_reading[train_ind, ]
+test_r <- df_reading[-train_ind, ]
+
+#Declaring randomly sampled validation indices in preparation for K-Fold Validation
+
+ind <- sample(seq_len(nrow(train_r)), size = nrow(train_r))
+
+n <- (nrow(train_r)/10)
+nr <- nrow(train_r)
+validation_ind <- split(ind, rep(1:ceiling(nr/n), each=n, length.out=nr))
+
+
+train_r$boro = factor(train_r$boro)
+test_r$boro = factor(test_r$boro)
+
+
+
+
+
+#Using PCA for feature engineering on Linear Model
+
+train_r_pr1 <- df_reading[,c(1,4:29)]
+train_r_pr1.s <- scale(train_r_pr1)
+train_r_pr1.pcs <- prcomp(train_r_pr1.s)
+fviz_eig(train_r_pr1.pcs)
+get_eig(train_r_pr1.pcs)
+df_r_pr1_p <- train_r_pr1.pcs$x[,1:16]
+df_r_pr1_p <- data.frame(df_r_pr1_p, df_reading$critical_reading_mean, as.factor(df_reading$boro))
+colnames(df_r_pr1_p)[16:18] <- c("PC17","critical_reading_mean", "boro")
+
+train_r_pc <- df_r_pr1_p[train_ind, ]
+test_r_pc <- df_r_pr1_p[-train_ind, ]
+
+
+
+#Looping through validation sets to obtain Model Performance measures of LM Variants (Manual Example)
+
+RMSEsLM <- double(10)
+RMSEsLMp <- double(10)
+RMSEsLMr <- double(10)
+
+R2sLM <- double(10)
+R2sLMp <- double(10)
+R2sLMr <- double(10)
+
+RMSEsLM <- double(10)
+RMSEsRP <- double(10)
+RMSEsSVM <- double(10)
+RMSEsRF <- double(10)
+
+R2sLM <- double(10)
+R2sRP <- double(10)
+R2sSVM <- double(10)
+R2sRF <- double(10)
+
+rsq <- function (x, y) cor(x, y) ^ 2
+
+
+
+
+
+for (i in 1:10){
+
+
+    validate = as.data.frame(train_r[unlist(validation_ind[i]),])
+    train = as.data.frame(train_r[unlist(validation_ind[-i]),])
+
+    validate_pc = as.data.frame(train_r_pc[unlist(validation_ind[i]),])
+    train_pc = as.data.frame(train_r_pc[unlist(validation_ind[-i]),])
+    
+    lm_train = lm(critical_reading_mean~.,data=train)
+    lm_train_pc = lm(critical_reading_mean~.,data=train_pc)
+
+
+    predictions_lm = predict(lm_train,validate)
+    predictions_lm_pc = predict(lm_train_pc,validate_pc)
+
+    RMSEsLM[i] = RMSE(predictions_lm, validate$critical_reading_mean)
+    RMSEsLMp[i] = RMSE(predictions_lm_pc, validate_pc$critical_reading_mean)
+
+    R2sLM[i] = rsq(predictions_lm, validate$critical_reading_mean)
+    R2sLMp[i] = rsq(predictions_lm_pc, validate_pc$critical_reading_mean)
+
+
+    print(".")
+
+
+}
+
+
+df_models_manual_lm = data.frame(ModelType = c(replicate(10, "Linear Model Basic"),replicate(10, "Linear Model w/ PCs")), 
+                                Model_RMSE = c(RMSEsLM, RMSEsLMp), Model_R2 = c(R2sLM, R2sLMp), kFold = seq(1,10,by=1))
+
+
+#Training XGBoost model to test regularization in regression
+
+fit_control <- trainControl(## 10-fold CV
+     method = "cv",
+     number = 10)
+
+
+l1_fit <- train(as.numeric(critical_reading_mean) ~ ., 
+                data = train_r, 
+                method = "xgbLinear",
+                trControl = fit_control)
+
+cv1_p = predict(lm_train, test_r)
+cv2_p = predict(lm_train_pc, test_r_pc)
+cv3_p = predict(l1_fit, test_r)
+
+RMSE(cv1_p, test_r$critical_reading_mean)
+RMSE(cv2_p, test_r$critical_reading_mean)
+RMSE(cv3_p, test_r$critical_reading_mean)
+
+
+
+#XGBoost has highest accuracy with most generalization in Gaussian Regression technique
+
+
+
+#Plotting basic Linear Regression Model
+
+lmImp <- varImp(lm_train, scale = FALSE)
+r_nm<-rownames(data.frame(lmImp))
+Imp <- data.frame(lmImp)[,1]
+df_imp <- data.frame(r_nm,Imp)
+df_imp <- df_imp[order(Imp),]
+df_type = data.frame(names(lm_train$coefficients),as.vector(lm_train$coefficients))
+
+colnames(df_type) = c("r_nm","Coefficient Value")
+
+df_new = df_imp %>% inner_join(df_type)
+
+ggplot(subset(df_new, Imp > 1), aes(x = reorder(r_nm, -Imp), y = Imp, fill=`Coefficient Value`)) + 
+    geom_bar(stat = "identity")+ theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 13))+ggtitle("Reading Score Model Factors")
+
+
+
+#Plotting K-Fold Scores and hyperparameters from original XGBoost Technique (optimal alpha / lambda / learning rate)
+
+plot(l1_fit)
+
+
+
+
+#Exploring other predictive models using caret
+
+
+fit_control <- trainControl(## 10-fold CV
+     method = "cv",
+     number = 10)
+
+lm_fit <- train(as.numeric(critical_reading_mean) ~ ., 
+                data = train_r, 
+                method = "lm",
+                trControl = fit_control)
+
+rp_fit <- train(as.numeric(critical_reading_mean) ~ ., 
+                data = train_r, 
+                method = "rpart",
+                trControl = fit_control)
+
+kn_fit <- train(as.numeric(critical_reading_mean) ~ ., 
+                 data = train_r, 
+                 method = "knn",
+                trControl = fit_control)
+
+
+
+sw_fit <- train(as.numeric(critical_reading_mean) ~ ., 
+                data = train_r, 
+                method = "lmStepAIC",
+                trControl = fit_control)
+
+sv_fit <- train(as.numeric(critical_reading_mean) ~ ., 
+                data = train_r, 
+                method = "svmLinear",
+                trControl = fit_control)
+
+rf_fit <- train(as.numeric(critical_reading_mean) ~ ., 
+                data = train_r, 
+                method = "rf",
+                trControl = fit_control)
+
+results <- resamples(list(KNN=kn_fit, RF=rf_fit, SW=sw_fit, XG = l1_fit, LM=lm_fit, SVM=sv_fit))
+bwplot(results)
+
+final_model = randomForest(critical_reading_mean~.,data=train_r, ntree = 500, mtry=16)
+
+cv4_p = predict(lm_fit, test_r)
+cv5_p = predict(rp_fit, test_r)
+cv6_p = predict(kn_fit, test_r)
+cv7_p = predict(sw_fit, test_r)
+cv8_p = predict(sv_fit, test_r)
+cv9_p = predict(rf_fit, test_r)
+
+r4 = RMSE(cv4_p, test_r$critical_reading_mean)
+r5 = RMSE(cv5_p, test_r$critical_reading_mean)
+r6 = RMSE(cv6_p, test_r$critical_reading_mean)
+
+r7 = RMSE(cv7_p, test_r$critical_reading_mean)
+r8 = RMSE(cv8_p, test_r$critical_reading_mean)
+r9 = RMSE(cv9_p, test_r$critical_reading_mean)
+
+r1 =RMSE(cv1_p, test_r$critical_reading_mean)
+r2 = RMSE(cv2_p, test_r$critical_reading_mean)
+r3 = RMSE(cv3_p, test_r$critical_reading_mean)
+
+CV_Scores_df = data.frame(RMSEs = c(r1,r2,r3,r4,r5,r6,r7,r8,r9), LinearModels = c("Basic (Least Squares)", "Basic w/ PCA", "XGBoost", "LM Reconfigured", "RPART", "K-Nearest-Neighbors", "Stepwise AIC", "SVM", "Random Forest"))
+ggplot(CV_Scores_df,aes(LinearModels, RMSEs)) + geom_col()
